@@ -213,6 +213,39 @@ describe("skill description failure caching and shutdown", () => {
 		expect(new SkillDescriptionCatalog({ store }).render([entry])[0].description).toBe(compressed);
 	});
 
+	it("attributes a queued unusable answer to the model selected before a role change", async () => {
+		using store = SkillDescriptionStore.open(path.join(tempDir, "cache.db"));
+		const authStorage = createInMemoryAuthStorage();
+		authStorages.push(authStorage);
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const settings = Settings.isolated({ modelRoles: { smol: "anthropic/claude-sonnet-4-5" } });
+		const registry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"), { settings });
+		const complete = vi
+			.spyOn(agentCore, "instrumentedCompleteSimple")
+			.mockResolvedValue(
+				createAssistantMessage("one two three four five six seven eight nine ten eleven twelve thirteen"),
+			);
+		const entry = skill();
+		const first = new SkillDescriptionCatalog({
+			store,
+			compress: createSkillDescriptionCompressor(registry, settings),
+		});
+		first.render([entry]);
+		settings.overrideModelRoles({ smol: "anthropic/claude-haiku-4-5" });
+		await first.waitForPending();
+		expect(complete.mock.calls[0]?.[0].id).toBe("claude-sonnet-4-5");
+
+		complete.mockResolvedValue(createAssistantMessage(compressed));
+		const next = new SkillDescriptionCatalog({
+			store,
+			compress: createSkillDescriptionCompressor(registry, settings),
+		});
+		next.render([entry]);
+		await next.waitForPending();
+		expect(complete.mock.calls[1]?.[0].id).toBe("claude-haiku-4-5");
+		expect(new SkillDescriptionCatalog({ store }).render([entry])[0].description).toBe(compressed);
+	});
+
 	it("does not ask the same model again after a length stop, even when the partial text would pass validation", async () => {
 		using store = SkillDescriptionStore.open(path.join(tempDir, "cache.db"));
 		const entry = skill();
