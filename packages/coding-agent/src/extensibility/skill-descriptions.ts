@@ -325,6 +325,8 @@ export class SkillDescriptionCatalog {
 	readonly #store: SkillDescriptionStore | undefined;
 	readonly #compress?: SkillDescriptionCompressor;
 	readonly #snapshot = new Map<string, string>();
+	#modelKey?: string;
+	#modelKeyResolved = false;
 
 	/** `store` defaults to {@link sharedSkillDescriptionStore}; without one, prompts keep previews. */
 	constructor(options: { store?: SkillDescriptionStore; compress?: SkillDescriptionCompressor } = {}) {
@@ -354,7 +356,17 @@ export class SkillDescriptionCatalog {
 				}
 				if (description === undefined) {
 					description = previewSkillDescription(skill.description);
-					if (store) this.#schedule(store, key, skill);
+					if (store && this.#compress && !store.isClosing) {
+						try {
+							const model = this.#selectedModelKey();
+							const unusableKey = model === undefined ? undefined : `${key}:${model}`;
+							if (unusableKey === undefined || store.get(unusableKey) === undefined) {
+								this.#schedule(store, key, skill, model);
+							}
+						} catch (error) {
+							logger.warn("Skill description compression failed", { skill: skill.name, error: String(error) });
+						}
+					}
 				}
 				this.#snapshot.set(key, description);
 			}
@@ -368,7 +380,15 @@ export class SkillDescriptionCatalog {
 		await Promise.all(pendingForStore(this.#store));
 	}
 
-	#schedule(store: SkillDescriptionStore, key: string, skill: Skill): void {
+	#selectedModelKey(): string | undefined {
+		if (!this.#modelKeyResolved) {
+			this.#modelKey = this.#compress?.modelKey();
+			this.#modelKeyResolved = true;
+		}
+		return this.#modelKey;
+	}
+
+	#schedule(store: SkillDescriptionStore, key: string, skill: Skill, model: string | undefined): void {
 		const compressor = this.#compress;
 		if (!compressor || store.isClosing) return;
 		const job = `${store.path}:${key}`;
@@ -379,8 +399,7 @@ export class SkillDescriptionCatalog {
 				await compressionSlots.acquire();
 				try {
 					if (store.isClosing) return;
-					// Unusable answers are remembered per model: that model is not asked again, a newly selected one is.
-					const model = compressor.modelKey();
+					// A different catalog can write an unusable answer while this job waits for a slot.
 					const unusableKey = model === undefined ? undefined : `${key}:${model}`;
 					if (unusableKey !== undefined && store.get(unusableKey) !== undefined) return;
 					const request = prompt.render(compressDescriptionPrompt, {

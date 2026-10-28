@@ -179,6 +179,25 @@ describe("skill description failure caching and shutdown", () => {
 		expect(retry).toHaveBeenCalledTimes(0);
 	});
 
+	it("resolves the model once for cached unusable answers across a skill catalog", async () => {
+		using store = SkillDescriptionStore.open(path.join(tempDir, "cache.db"));
+		const skills = Array.from({ length: 90 }, (_, index) => skill(`migration-${index}`));
+		const first = new SkillDescriptionCatalog({ store, compress: fast(async () => "Bad\nanswer") });
+		first.render(skills);
+		await first.waitForPending();
+
+		const compress = vi.fn(async () => compressed);
+		const modelKey = vi.fn(() => "test/fast");
+		const second = new SkillDescriptionCatalog({ store, compress: { modelKey, compress } });
+		const rendered = second.render(skills);
+		expect(rendered.map(entry => entry.description)).toEqual(
+			skills.map(entry => previewSkillDescription(entry.description)),
+		);
+		expect(modelKey).toHaveBeenCalledTimes(1);
+		await second.waitForPending();
+		expect(compress).toHaveBeenCalledTimes(0);
+	});
+
 	it("asks a newly selected model after the previous model's answer was unusable", async () => {
 		using store = SkillDescriptionStore.open(path.join(tempDir, "cache.db"));
 		const entry = skill();
