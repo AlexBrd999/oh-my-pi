@@ -36,7 +36,7 @@ from robomp import host_tools, persona, pragmas
 from robomp.cancellation import register_cancel_hook, unregister_cancel_hook
 from robomp.config import Settings
 from robomp.db import Database, issue_key
-from robomp.git_ops import DirtyState, inspect_dirty_state
+from robomp.git_ops import DirtyState, inspect_dirty_state, redact_credentials
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import CommentInfo, IssueInfo, PullRequestInfo, RepoInfo
 from robomp.host_tools import AbortController, ReleaseToolContext, ToolBindings, _git_identity_env
@@ -581,7 +581,10 @@ def _run_rpc_blocking(
     def _on_host_tool_rejected(event: HostToolRejectedEvent) -> None:
         # omp rejected the arguments before dispatch (direct call, xd:// write,
         # or eval bridge), so `execute()` never ran to write its own audit row.
-        bindings.db.log_tool_call(issue_key=bindings.issue_key, tool=event.tool_name, args={}, error=event.error)
+        # The validation message echoes the received arguments; redact before persisting.
+        bindings.db.log_tool_call(
+            issue_key=bindings.issue_key, tool=event.tool_name, args={}, error=redact_credentials(event.error)
+        )
 
     def _on_host_tool_completed(event: HostToolCompletedEvent) -> None:
         # Fires for every dispatch path (top-level, `write xd://X`, eval

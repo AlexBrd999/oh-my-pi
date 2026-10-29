@@ -841,14 +841,17 @@ async def test_run_rpc_review_pr_still_reminds_when_submit_fails(
 def test_run_rpc_audits_host_tool_rejected_before_dispatch(
     tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch, db: Database
 ) -> None:
-    """An eval-bridged call rejected by validation reaches the ledger once; failed tool ends add nothing."""
+    """An eval-bridged call rejected by validation reaches the ledger once, credential-redacted; failed tool ends add nothing."""
     inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False)
     bindings.db = db
 
     def _on_prompt(client: _FakeRpcClient, prompt: str) -> None:
         if prompt != "kickoff":
             return
-        client.emit_host_tool_rejected("classify_pr", 'Validation failed for tool "classify_pr": rank required')
+        client.emit_host_tool_rejected(
+            "classify_pr",
+            'Validation failed for tool "classify_pr": rank required\nReceived: {"url": "https://bot:ghp_secret@github.com/x"}',
+        )
         client.emit_tool_end("eval", is_error=True)
         client.emit_tool_end("classify_pr", is_error=True)
 
@@ -870,7 +873,11 @@ def test_run_rpc_audits_host_tool_rejected_before_dispatch(
         (bindings.issue_key,),
     ).fetchall()
     assert [(row["tool"], row["args_json"], row["error"]) for row in rows] == [
-        ("classify_pr", "{}", 'Validation failed for tool "classify_pr": rank required'),
+        (
+            "classify_pr",
+            "{}",
+            'Validation failed for tool "classify_pr": rank required\nReceived: {"url": "https://***@github.com/x"}',
+        ),
     ]
 
 
