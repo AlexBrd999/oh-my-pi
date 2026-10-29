@@ -49,8 +49,9 @@ own `releases` row and `.omp-session-<tag>` transcript.
 
 The agent uses omp's built-in tools (`read`/`edit`/`bash`/`lsp`, scoped to
 the worktree) plus the host tools in `src/host_tools.py` — the
-exclusive surface for GitHub writes. Every host-tool invocation is audited
-into the `tool_calls` table with credential-redacted args and results.
+exclusive surface for GitHub writes. Host-tool calls are audited in
+`tool_calls`; calls rejected before execution record a safe error reason
+without copying their arguments into the ledger.
 
 ## Setup
 
@@ -206,6 +207,9 @@ The integration test spawns a real `omp --mode rpc` against an
 - **No PR without a recorded repro.** Persona prompt requires
   `repro_record`; `mark_unable_to_reproduce` asks for missing details,
   marks the row `needs_info`, and resumes the same session on the next reply.
+- **Incoming PR reviews require a rank.** `classify_pr` persists the review
+  rank for the current PR; `submit_pr_review` refuses to publish until that
+  classification exists, leaving staged inline comments intact on rejection.
 - **Crash recovery.** On startup, `db.reset_stuck_running()` flips
   `running` rows back to `queued`. Existing `<session_dir>/*.jsonl`
   triggers `--continue`. Drain bounded by

@@ -16,19 +16,24 @@ import asyncio
 import grp
 import logging
 import os
+import re
 import shutil
 import threading
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from omp_rpc import (
+    HostTool,
     HostToolCompletedEvent,
+    HostToolContext,
     MessageUpdateEvent,
     RpcClient,
     RpcError,
     RpcProcessExitError,
     ToolExecutionEndEvent,
+    ToolExecutionStartEvent,
 )
 
 from robomp import host_tools, persona, pragmas
@@ -250,6 +255,37 @@ _TERMINAL_TRIAGE_TOOLS: frozenset[str] = frozenset({"gh_open_pr", "mark_unable_t
 _TERMINAL_REVIEW_TOOLS: frozenset[str] = frozenset({"submit_pr_review", "abort_task"})
 _TERMINAL_RELEASE_TOOLS: frozenset[str] = frozenset({"release_retag", "abort_task"})
 _PR_REQUIRING_CLASSIFICATIONS: frozenset[str] = frozenset({"bug", "documentation"})
+
+_MISSING_TOOL_FIELD = re.compile(
+    r"\bmissing required (?:field|property|parameter)\s*:?\s*[`'\"]?([a-zA-Z_][a-zA-Z_0-9]*)\b",
+    re.I,
+)
+
+
+def _host_tool_rejection_reason(result: Any, parameters: Mapping[str, Any]) -> str:
+    """Extract only a schema diagnostic we can reproduce without copying agent input."""
+    texts: list[str] = []
+    if isinstance(result, str):
+        texts.append(result)
+    elif isinstance(result, Mapping):
+        error = result.get("error")
+        if isinstance(error, str):
+            texts.append(error)
+        content = result.get("content")
+        if isinstance(content, list):
+            texts.extend(
+                item["text"]
+                for item in content
+                if isinstance(item, Mapping) and item.get("type") == "text" and isinstance(item.get("text"), str)
+            )
+    properties = parameters.get("properties")
+    for text in texts:
+        if text.strip() == "Host tool arguments must be an object":
+            return "Host tool arguments must be an object"
+        match = _MISSING_TOOL_FIELD.search(text)
+        if match and isinstance(properties, Mapping) and match.group(1) in properties:
+            return f"missing required field {match.group(1)}"
+    return "host tool invocation rejected before execute (schema/RPC/transport error)"
 
 
 def _task_timeout(settings: Settings, task_kind: str) -> float:
@@ -557,15 +593,49 @@ def _run_rpc_blocking(
     settings = inputs.settings
 
     tools_called: set[str] = set()
+    host_tool_calls_executed: set[str] = set()
+    host_tool_names_by_call_id: dict[str, str] = {}
+    configured_tools = host_tools.build(bindings)
+    known_host_tools = {tool.name: tool for tool in configured_tools}
+
+    def _track_execution(tool: HostTool[Any, Any]) -> HostTool[Any, Any]:
+        def execute(args: Any, ctx: HostToolContext[Any]) -> Any:
+            host_tool_calls_executed.add(ctx.tool_call_id)
+            return tool.execute(args, ctx)
+
+        return replace(tool, execute=execute)
+
+    audited_tools = tuple(_track_execution(tool) for tool in configured_tools)
+
+    def _on_tool_start(event: ToolExecutionStartEvent) -> None:
+        # A rejected xd:// write has no host_tool_call frame, so omp_rpc cannot
+        # normalize its end event. Retain only the known tool name, never args.
+        if event.tool_name == "write" and isinstance(event.args, Mapping):
+            path = event.args.get("path")
+            if isinstance(path, str) and path.startswith("xd://"):
+                name = path.removeprefix("xd://")
+                if name in known_host_tools:
+                    host_tool_names_by_call_id[event.tool_call_id] = name
 
     def _on_tool_end(event: ToolExecutionEndEvent) -> None:
-        tool_name = event.tool_name
+        tool_name = host_tool_names_by_call_id.pop(event.tool_call_id, event.tool_name)
+        executed = event.tool_call_id in host_tool_calls_executed
+        host_tool_calls_executed.discard(event.tool_call_id)
         # `tool_name` is transport-normalized by omp_rpc for top-level and
         # xd:// device dispatches, but an eval-bridged host tool only surfaces
         # as the enclosing `eval`; terminal-action detection therefore relies
         # on `_on_host_tool_completed`. A failed execution (`is_error`) does
         # not count — a rejected submit must still trigger the reminder.
         ok = event.result is not None and not event.is_error
+        # Execute-level audits already own dispatched calls. Bridge/schema
+        # rejections never entered execute and otherwise vanish from the ledger.
+        if event.is_error and tool_name in known_host_tools and not executed:
+            bindings.db.log_tool_call(
+                issue_key=bindings.issue_key,
+                tool=tool_name,
+                args={},
+                error=_host_tool_rejection_reason(event.result, known_host_tools[tool_name].parameters),
+            )
         if ok:
             tools_called.add(tool_name)
         log.info(
@@ -664,7 +734,7 @@ def _run_rpc_blocking(
         provider=settings.provider,
         thinking=chosen_thinking if chosen_thinking != "off" else None,
         append_system_prompt=append_system_prompt,
-        custom_tools=host_tools.build(bindings),
+        custom_tools=audited_tools,
         request_timeout=settings.request_timeout_seconds,
         startup_timeout=60.0,
         max_event_history=50_000,
@@ -700,6 +770,7 @@ def _run_rpc_blocking(
         register_cancel_hook(_cancel_hook)
         try:
             client.install_headless_ui()
+            client.on_tool_execution_start(_on_tool_start)
             client.on_tool_execution_end(_on_tool_end)
             client.on_host_tool_completed(_on_host_tool_completed)
             client.on_message_update(_on_msg)
