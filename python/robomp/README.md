@@ -50,8 +50,9 @@ own `releases` row and `.omp-session-<tag>` transcript.
 The agent uses omp's built-in tools (`read`/`edit`/`bash`/`lsp`, scoped to
 the worktree) plus the host tools in `src/host_tools.py` — the
 exclusive surface for GitHub writes. Host-tool calls are audited in
-`tool_calls`; calls rejected before execution record a safe error reason
-without copying their arguments into the ledger.
+`tool_calls`; calls omp rejects before dispatch (argument validation on a
+direct call, `xd://` write, or eval bridge) arrive as `host_tool_rejected`
+frames and are recorded with omp's validation message.
 
 ## Setup
 

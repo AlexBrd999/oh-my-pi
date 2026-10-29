@@ -8,7 +8,6 @@ whether the workspace's omp session directory already holds a JSONL transcript.
 from __future__ import annotations
 
 import asyncio
-import json
 import stat
 from collections.abc import Callable
 from functools import partial
@@ -17,7 +16,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from omp_rpc import host_tool
 
 from robomp import worker
 from robomp.config import Settings
@@ -38,8 +36,8 @@ class _FakeRpcClient:
         self.kwargs = kwargs
         self.on_prompt = on_prompt
         self.prompts: list[str] = []
-        self.tool_start_listeners: list[Callable[[Any], None]] = []
         self.tool_end_listeners: list[Callable[[Any], None]] = []
+        self.host_tool_rejected_listeners: list[Callable[[Any], None]] = []
         self.host_tool_completed_listeners: list[Callable[[Any], None]] = []
         self.set_todos_calls: list[list[dict]] = []
         self.get_todos_calls = 0
@@ -56,11 +54,11 @@ class _FakeRpcClient:
     def install_headless_ui(self) -> None:
         pass
 
-    def on_tool_execution_start(self, cb) -> None:
-        self.tool_start_listeners.append(cb)
-
     def on_tool_execution_end(self, cb) -> None:
         self.tool_end_listeners.append(cb)
+
+    def on_host_tool_rejected(self, cb) -> None:
+        self.host_tool_rejected_listeners.append(cb)
 
     def on_host_tool_completed(self, cb) -> None:
         self.host_tool_completed_listeners.append(cb)
@@ -81,11 +79,6 @@ class _FakeRpcClient:
         self.get_todos_calls += 1
         return ()
 
-    def emit_tool_start(self, tool_name: str, *, tool_call_id: str, args: Any) -> None:
-        event = SimpleNamespace(tool_name=tool_name, tool_call_id=tool_call_id, args=args)
-        for cb in self.tool_start_listeners:
-            cb(event)
-
     def emit_tool_end(
         self,
         tool_name: str,
@@ -101,6 +94,11 @@ class _FakeRpcClient:
             is_error=is_error,
         )
         for cb in self.tool_end_listeners:
+            cb(event)
+
+    def emit_host_tool_rejected(self, tool_name: str, error: str) -> None:
+        event = SimpleNamespace(tool_name=tool_name, tool_call_id=f"js-{tool_name}-1", error=error)
+        for cb in self.host_tool_rejected_listeners:
             cb(event)
 
     def emit_host_tool_completed(self, tool_name: str) -> None:
@@ -840,57 +838,19 @@ async def test_run_rpc_review_pr_still_reminds_when_submit_fails(
     assert all("submit_pr_review" in p for p in fake.prompts[1:])
 
 
-def test_run_rpc_audits_only_rejected_host_invocations(
+def test_run_rpc_audits_host_tool_rejected_before_dispatch(
     tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch, db: Database
 ) -> None:
+    """An eval-bridged call rejected by validation reaches the ledger once; failed tool ends add nothing."""
     inputs, bindings = _make_inputs(tmp_path, settings, session_has_jsonl=False)
-    inputs.db = db
     bindings.db = db
 
-    def execute(args: dict[str, Any], _ctx: Any) -> str:
-        db.log_tool_call(issue_key=bindings.issue_key, tool="classify_pr", args=args, error="execute refused")
-        raise RuntimeError("execute refused")
-
-    tool = host_tool(
-        name="classify_pr",
-        description="Classify incoming PR",
-        parameters={
-            "type": "object",
-            "properties": {"classification": {"type": "string"}},
-            "required": ["classification"],
-        },
-        execute=execute,
-    )
-    monkeypatch.setattr(worker.host_tools, "build", lambda _bindings: (tool,))
-
-    def _on_prompt(client: _FakeRpcClient, _prompt: str) -> None:
-        wrapped = client.kwargs["custom_tools"][0]
-        assert wrapped.name == tool.name
-        assert wrapped.description == tool.description
-        assert wrapped.parameters == tool.parameters
-        client.emit_tool_start(
-            "write", tool_call_id="rejected", args={"path": "xd://classify_pr", "content": "sensitive arguments"}
-        )
-        client.emit_tool_end(
-            "write",
-            tool_call_id="rejected",
-            result={"content": [{"type": "text", "text": "missing required field 'classification'"}]},
-            is_error=True,
-        )
-        with pytest.raises(RuntimeError, match="execute refused"):
-            wrapped.execute({"classification": "bug"}, SimpleNamespace(tool_call_id="executed"))
-        client.emit_tool_end(
-            "classify_pr",
-            tool_call_id="executed",
-            result={"content": [{"type": "text", "text": "execute refused"}]},
-            is_error=True,
-        )
-        client.emit_tool_end(
-            "read",
-            tool_call_id="builtin",
-            result={"content": [{"type": "text", "text": "failed"}]},
-            is_error=True,
-        )
+    def _on_prompt(client: _FakeRpcClient, prompt: str) -> None:
+        if prompt != "kickoff":
+            return
+        client.emit_host_tool_rejected("classify_pr", 'Validation failed for tool "classify_pr": rank required')
+        client.emit_tool_end("eval", is_error=True)
+        client.emit_tool_end("classify_pr", is_error=True)
 
     _install_prompt_hook(monkeypatch, _on_prompt)
     loop = asyncio.new_event_loop()
@@ -909,24 +869,9 @@ def test_run_rpc_audits_only_rejected_host_invocations(
         "SELECT tool, args_json, error FROM tool_calls WHERE issue_key=? ORDER BY id",
         (bindings.issue_key,),
     ).fetchall()
-    assert [(row["tool"], row["error"]) for row in rows] == [
-        ("classify_pr", "missing required field classification"),
-        ("classify_pr", "execute refused"),
+    assert [(row["tool"], row["args_json"], row["error"]) for row in rows] == [
+        ("classify_pr", "{}", 'Validation failed for tool "classify_pr": rank required'),
     ]
-    assert json.loads(rows[0]["args_json"]) == {}
-    assert json.loads(rows[1]["args_json"]) == {"classification": "bug"}
-
-
-def test_host_tool_rejection_reason_does_not_store_untrusted_result() -> None:
-    schema = {"properties": {"classification": {"type": "string"}}}
-    assert (
-        worker._host_tool_rejection_reason("missing required property classification", schema)
-        == "missing required field classification"
-    )
-    assert worker._host_tool_rejection_reason(None, schema).startswith("host tool invocation rejected")
-    assert worker._host_tool_rejection_reason(
-        {"content": [{"type": "text", "text": "token=ghp_secretvalue"}]}, schema
-    ).startswith("host tool invocation rejected")
 
 
 @pytest.mark.asyncio
